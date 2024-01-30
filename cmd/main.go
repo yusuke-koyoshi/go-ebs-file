@@ -27,10 +27,15 @@ func (p *DummyCredentialProvider) Retrieve(ctx context.Context) (aws.Credentials
 
 func main() {
 	var rs io.ReadSeeker
-	cli, err := ebsfile.New(context.TODO(),
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
 		config.WithRegion("YOUR_REGION"),
 		config.WithCredentialsProvider(&DummyCredentialProvider{}),
 	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	cli, err := ebsfile.New(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}

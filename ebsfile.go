@@ -8,7 +8,6 @@ import (
 	"os"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ebs"
 	"github.com/aws/aws-sdk-go-v2/service/ebs/types"
 )
@@ -89,13 +88,8 @@ type File struct {
 	ctx       context.Context
 }
 
-func New(ctx context.Context, optFns ...func(*config.LoadOptions) error) (*EBS, error) {
-	cfg, err := config.LoadDefaultConfig(ctx, optFns...)
-	if err != nil {
-		return nil, err
-	}
-
-	ebsClient := ebs.NewFromConfig(cfg)
+func New(awsCfg aws.Config) (*EBS, error) {
+	ebsClient := ebs.NewFromConfig(awsCfg)
 	return &EBS{ebsClient}, nil
 }
 
