@@ -1,4 +1,4 @@
-module github.com/masahiro331/go-ebs-file
+module github.com/yusuke-koyoshi/go-ebs-file
 
 go 1.18
 
