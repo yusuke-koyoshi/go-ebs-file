@@ -5,6 +5,9 @@ var (
 	_ Cache[int64, []byte]  = &mockCache[int64, []byte]{}
 )
 
+// Cache stores the blocks read from a snapshot. Its methods must be safe for
+// concurrent use, because a single ReadAt spanning several blocks calls them
+// from several goroutines.
 type Cache[K comparable, V any] interface {
 	// Add cache data
 	Add(key K, value V) bool
