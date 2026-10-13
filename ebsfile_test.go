@@ -298,22 +298,35 @@ func TestReadAt_EOF(t *testing.T) {
 	}
 }
 
-// countingEBS counts GetSnapshotBlock calls. If release is set, each call
-// signals entered and blocks until release is closed. If mutate is set, it
-// can change the output of each call; call is 1 for the first call.
+// countingEBS counts GetSnapshotBlock calls and records the largest number of
+// calls in flight at once. If release is set, each call signals entered and
+// blocks until release is closed. If mutate is set, it can change the output
+// of each call; call is 1 for the first call. If blockErr is set and returns
+// an error for a block, the call fails with it.
 type countingEBS struct {
 	EBSAPI
 
-	calls   atomic.Int64
-	entered chan struct{}
-	release chan struct{}
-	err     error
-	latency time.Duration
-	mutate  func(call int64, out *ebs.GetSnapshotBlockOutput)
+	calls       atomic.Int64
+	inFlight    atomic.Int64
+	maxInFlight atomic.Int64
+	entered     chan struct{}
+	release     chan struct{}
+	err         error
+	blockErr    func(index int32) error
+	latency     time.Duration
+	mutate      func(call int64, out *ebs.GetSnapshotBlockOutput)
 }
 
 func (c *countingEBS) GetSnapshotBlock(ctx context.Context, params *ebs.GetSnapshotBlockInput, optFns ...func(*ebs.Options)) (*ebs.GetSnapshotBlockOutput, error) {
 	call := c.calls.Add(1)
+	inFlight := c.inFlight.Add(1)
+	defer c.inFlight.Add(-1)
+	for {
+		prev := c.maxInFlight.Load()
+		if inFlight <= prev || c.maxInFlight.CompareAndSwap(prev, inFlight) {
+			break
+		}
+	}
 	if c.entered != nil {
 		select {
 		case c.entered <- struct{}{}:
@@ -328,6 +341,11 @@ func (c *countingEBS) GetSnapshotBlock(ctx context.Context, params *ebs.GetSnaps
 	}
 	if c.err != nil {
 		return nil, c.err
+	}
+	if c.blockErr != nil {
+		if err := c.blockErr(*params.BlockIndex); err != nil {
+			return nil, err
+		}
 	}
 	out, err := c.EBSAPI.GetSnapshotBlock(ctx, params, optFns...)
 	if err == nil && c.mutate != nil {
@@ -503,6 +521,153 @@ func TestReadAt_ConcurrentReads(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestReadAt_MultiBlockReadFetchesConcurrently(t *testing.T) {
+	const numBlocks = 4
+	mock, data := newPatternMock(16, numBlocks)
+	api := &countingEBS{
+		EBSAPI:  mock,
+		entered: make(chan struct{}, numBlocks),
+		release: make(chan struct{}),
+	}
+	sr, err := Open("snap-test", context.Background(), nil, api)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, len(data)-8)
+	done := make(chan error, 1)
+	go func() {
+		_, err := sr.ReadAt(buf, 4)
+		done <- err
+	}()
+	// Each call blocks until release is closed, so all blocks enter only if
+	// they are fetched concurrently.
+	for i := 0; i < numBlocks; i++ {
+		select {
+		case <-api.entered:
+		case <-time.After(5 * time.Second):
+			close(api.release)
+			t.Fatalf("%d of %d blocks were being fetched at once", i, numBlocks)
+		}
+	}
+	close(api.release)
+
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, data[4:len(data)-4]) {
+		t.Error("ReadAt returned wrong data")
+	}
+}
+
+func TestReadAt_MaxConcurrentBlocks(t *testing.T) {
+	mock, data := newPatternMock(16, 4)
+	api := &countingEBS{EBSAPI: mock, latency: 20 * time.Millisecond}
+	sr, err := OpenWithOptions("snap-test", context.Background(), nil, api, OpenOptions{MaxConcurrentBlocks: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, len(data))
+	if _, err := sr.ReadAt(buf, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, data) {
+		t.Error("ReadAt returned wrong data")
+	}
+	if got := api.maxInFlight.Load(); got != 2 {
+		t.Errorf("GetSnapshotBlock calls in flight = %d, want 2", got)
+	}
+}
+
+func TestReadAt_MultiBlockReadUsesCachedBlocks(t *testing.T) {
+	mock, data := newPatternMock(16, 3)
+	api := &countingEBS{EBSAPI: mock}
+	sr, err := Open("snap-test", context.Background(), newMapCache(), api)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for round := 0; round < 2; round++ {
+		buf := make([]byte, len(data)-8)
+		if _, err := sr.ReadAt(buf, 4); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(buf, data[4:len(data)-4]) {
+			t.Errorf("round %d: ReadAt returned wrong data", round)
+		}
+	}
+	if got := api.calls.Load(); got != 3 {
+		t.Errorf("GetSnapshotBlock calls = %d, want 3", got)
+	}
+}
+
+func TestReadAt_SharedCacheSeparatesSnapshots(t *testing.T) {
+	cache := newMapCache()
+	mockA, dataA := newPatternMock(16, 1)
+	dataB := bytes.Repeat([]byte{0xAB}, 16)
+	mockB := &MockEBS{
+		Reader:     bytes.NewReader(dataB),
+		BlockSize:  aws.Int32(16),
+		VolumeSize: aws.Int64(16),
+	}
+
+	srA, err := Open("snap-a", context.Background(), cache, mockA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srB, err := Open("snap-b", context.Background(), cache, mockB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		sr   *io.SectionReader
+		want []byte
+	}{{srA, dataA}, {srB, dataB}} {
+		buf := make([]byte, 16)
+		if _, err := tc.sr.ReadAt(buf, 0); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(buf, tc.want) {
+			t.Errorf("ReadAt = %v, want %v", buf, tc.want)
+		}
+	}
+}
+
+func TestReadAt_ErrorInMiddleBlockReturnsPrecedingBytes(t *testing.T) {
+	errFetch := errors.New("fetch failed")
+	mock, data := newPatternMock(16, 3)
+	api := &countingEBS{
+		EBSAPI: mock,
+		blockErr: func(index int32) error {
+			if index == 1 {
+				return errFetch
+			}
+			return nil
+		},
+	}
+	sr, err := Open("snap-test", context.Background(), nil, api)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 40)
+	n, err := sr.ReadAt(buf, 4)
+	if !errors.Is(err, errFetch) {
+		t.Fatalf("ReadAt error = %v, want %v", err, errFetch)
+	}
+	if n != 12 {
+		t.Fatalf("ReadAt n = %d, want 12", n)
+	}
+	if !bytes.Equal(buf[:n], data[4:16]) {
+		t.Errorf("ReadAt = %v, want %v", buf[:n], data[4:16])
+	}
+	if got := api.calls.Load(); got != 3 {
+		t.Errorf("GetSnapshotBlock calls = %d, want 3", got)
+	}
 }
 
 func newChecksumFixture(t *testing.T, mutate func(int64, *ebs.GetSnapshotBlockOutput), options OpenOptions) (*countingEBS, *io.SectionReader, []byte) {
