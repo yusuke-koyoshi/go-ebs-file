@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -168,10 +170,6 @@ type EBSAPI interface {
 	WalkSnapshotBlocks(ctx context.Context, input *ebs.ListSnapshotBlocksInput, table map[int32]string) (*ebs.ListSnapshotBlocksOutput, map[int32]string, error)
 }
 
-func cacheKey(n int64) string {
-	return fmt.Sprintf("ebs:%d", n)
-}
-
 type File struct {
 	snapshotID string
 	size       int64
@@ -182,9 +180,16 @@ type File struct {
 	cache     Cache[string, []byte]
 	ctx       context.Context
 	group     singleflight.Group
+	fetchSem  chan struct{} // nil means unlimited
 
 	allowMissingChecksum bool
 	fetchAttempts        int
+}
+
+// cacheKey includes the snapshot ID so that readers of different snapshots
+// can share one Cache.
+func (f *File) cacheKey(index int32) string {
+	return "ebs:" + f.snapshotID + ":" + strconv.Itoa(int(index))
 }
 
 // DefaultBlockFetchAttempts is the number of times a block is fetched when its
@@ -196,7 +201,9 @@ const DefaultBlockFetchAttempts = 2
 type OpenOptions struct {
 	// AllowMissingChecksum accepts GetSnapshotBlock responses without a
 	// checksum. By default such a response is an error. A checksum that does
-	// not match the block data is an error regardless of this option.
+	// not match the block data is an error regardless of this option. Blocks
+	// accepted without a checksum are cached like verified ones, so do not
+	// share the Cache with a reader that does not set this option.
 	AllowMissingChecksum bool
 
 	// BlockFetchAttempts is the maximum number of GetSnapshotBlock calls for a
@@ -205,6 +212,12 @@ type OpenOptions struct {
 	// DefaultBlockFetchAttempts. Errors returned by GetSnapshotBlock itself are
 	// not refetched, because the AWS SDK has already retried them.
 	BlockFetchAttempts int
+
+	// MaxConcurrentBlocks limits the number of blocks this reader fetches, and
+	// so holds outside the Cache, at once. A non-positive value leaves it
+	// unlimited, so a ReadAt spanning n uncached blocks issues n
+	// GetSnapshotBlock requests at once.
+	MaxConcurrentBlocks int
 }
 
 var (
@@ -277,12 +290,15 @@ func OpenWithOptions(snapID string, ctx context.Context, cache Cache[string, []b
 		allowMissingChecksum: options.AllowMissingChecksum,
 		fetchAttempts:        options.BlockFetchAttempts,
 	}
+	if options.MaxConcurrentBlocks > 0 {
+		f.fetchSem = make(chan struct{}, options.MaxConcurrentBlocks)
+	}
 	return io.NewSectionReader(f, 0, f.Size()), nil
 }
 
-// ReadAt implements io.ReaderAt. It is safe for concurrent use if the Cache
-// passed to Open is. Concurrent reads of the same uncached block share a
-// single GetSnapshotBlock request.
+// ReadAt implements io.ReaderAt and is safe for concurrent use. The uncached
+// blocks in [off, off+len(p)) are fetched concurrently, and concurrent reads
+// of the same uncached block share a single GetSnapshotBlock request.
 func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
 	if off < 0 {
 		return 0, fmt.Errorf("ebsfile: negative offset %d", off)
@@ -290,59 +306,130 @@ func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
 	if off >= f.size {
 		return 0, io.EOF
 	}
-
-	for n < len(p) && off+int64(n) < f.size {
-		index, dataOffset := f.translateOffset(off + int64(n))
-		readable := int(f.blockSize - dataOffset)
-		remaining := len(p) - n
-		if readable > remaining {
-			readable = remaining
-		}
-		if volRemaining := int(f.size - off - int64(n)); readable > volRemaining {
-			readable = volRemaining
-		}
-
-		token, ok := f.blockTable[index]
-		if !ok {
-			// Blocks not in blockTable are unallocated in the EBS snapshot,
-			// which represent zero-filled disk regions.
-			for i := 0; i < readable; i++ {
-				p[n+i] = 0
-			}
-			n += readable
-			continue
-		}
-
-		var buf []byte
-		buf, err = f.loadBlock(index, token)
-		if err != nil {
-			return n, err
-		}
-		if len(buf) != int(f.blockSize) {
-			return n, fmt.Errorf("invalid block size: len(buf): %d != f.blockSize: %d", len(buf), f.blockSize)
-		}
-
-		copied := copy(p[n:], buf[dataOffset:dataOffset+int32(readable)])
-		n += copied
+	end := off + int64(len(p))
+	if end > f.size {
+		end = f.size
+	}
+	if end == off {
+		return 0, nil
 	}
 
+	blockSize := int64(f.blockSize)
+	first := int32(off / blockSize)
+	errs := f.readBlocks(p[:end-off], off, first, int32((end-1)/blockSize))
+
+	for i, err := range errs {
+		if err != nil {
+			// Report only the bytes before the failing block; later blocks
+			// may have been copied, but p is scratch space on error.
+			if blockStart := int64(first+int32(i)) * blockSize; blockStart > off {
+				n = int(blockStart - off)
+			}
+			return n, err
+		}
+	}
+
+	n = int(end - off)
 	if n < len(p) {
 		return n, io.EOF
 	}
 	return n, nil
 }
 
-// loadBlock returns the block at index, coalescing concurrent fetches of it.
-func (f *File) loadBlock(index int32, token string) ([]byte, error) {
-	key := cacheKey(int64(index))
-	if buf, ok := f.cache.Get(key); ok {
-		return buf, nil
+// readBlocks copies the blocks first to last into p, which holds the bytes
+// from off, and returns the error of each block. Fetched blocks are copied as
+// soon as they arrive, so only the blocks in flight are held at once.
+func (f *File) readBlocks(p []byte, off int64, first, last int32) []error {
+	errs := make([]error, last-first+1)
+
+	var missing []int
+	var lastKey string
+	for i := range errs {
+		index := first + int32(i)
+		if _, ok := f.blockTable[index]; !ok {
+			// Blocks not in blockTable are unallocated in the EBS snapshot,
+			// which represent zero-filled disk regions.
+			dst, _ := f.blockSpan(p, off, index)
+			for j := range dst {
+				dst[j] = 0
+			}
+			continue
+		}
+		key := f.cacheKey(index)
+		if buf, ok := f.cache.Get(key); ok {
+			errs[i] = f.copyBlock(p, off, index, buf)
+			continue
+		}
+		missing = append(missing, i)
+		lastKey = key
+	}
+	if len(missing) == 1 {
+		// Most reads fall within one block; skip the goroutine for them.
+		i := missing[0]
+		errs[i] = f.fetchInto(p, off, first+int32(i), lastKey)
+		return errs
 	}
 
+	var wg sync.WaitGroup
+	for _, i := range missing {
+		wg.Add(1)
+		go func(i int, index int32) {
+			defer wg.Done()
+			errs[i] = f.fetchInto(p, off, index, f.cacheKey(index))
+		}(i, first+int32(i))
+	}
+	wg.Wait()
+	return errs
+}
+
+func (f *File) fetchInto(p []byte, off int64, index int32, key string) error {
+	buf, err := f.fetchShared(index, key, f.blockTable[index])
+	if err != nil {
+		return err
+	}
+	return f.copyBlock(p, off, index, buf)
+}
+
+func (f *File) copyBlock(p []byte, off int64, index int32, buf []byte) error {
+	if len(buf) != int(f.blockSize) {
+		return fmt.Errorf("invalid block size: len(buf): %d != f.blockSize: %d", len(buf), f.blockSize)
+	}
+	dst, from := f.blockSpan(p, off, index)
+	copy(dst, buf[from:])
+	return nil
+}
+
+// blockSpan returns the part of p, which holds the bytes from off, that block
+// index covers, and where that part starts within the block.
+func (f *File) blockSpan(p []byte, off int64, index int32) ([]byte, int64) {
+	blockStart := int64(index) * int64(f.blockSize)
+	start, stop := blockStart, blockStart+int64(f.blockSize)
+	if start < off {
+		start = off
+	}
+	if end := off + int64(len(p)); stop > end {
+		stop = end
+	}
+	return p[start-off : stop-off], start - blockStart
+}
+
+// fetchShared fetches the block at index and caches it under key, coalescing
+// concurrent fetches of it. The caller has already missed the cache.
+func (f *File) fetchShared(index int32, key, token string) ([]byte, error) {
 	v, err, _ := f.group.Do(key, func() (any, error) {
-		// Another fetch may have cached the block since the Get above.
+		// Another fetch may have cached the block since the caller's Get.
 		if buf, ok := f.cache.Get(key); ok {
 			return buf, nil
+		}
+		// Acquire inside Do so that callers waiting on this fetch do not
+		// hold a slot.
+		if f.fetchSem != nil {
+			select {
+			case f.fetchSem <- struct{}{}:
+				defer func() { <-f.fetchSem }()
+			case <-f.ctx.Done():
+				return nil, fmt.Errorf("ebsfile: block %d: %w", index, f.ctx.Err())
+			}
 		}
 		buf, err := f.read(index, token)
 		if err != nil {
@@ -359,13 +446,6 @@ func (f *File) loadBlock(index int32, token string) ([]byte, error) {
 
 func (f *File) Size() int64 {
 	return f.size
-}
-
-func (f *File) translateOffset(offset int64) (int32, int32) {
-	index := offset / int64(f.blockSize)
-	dataOffset := offset % int64(f.blockSize)
-
-	return int32(index), int32(dataOffset)
 }
 
 func (f *File) read(index int32, token string) ([]byte, error) {
