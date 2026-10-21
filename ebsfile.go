@@ -184,6 +184,14 @@ type File struct {
 
 	allowMissingChecksum bool
 	fetchAttempts        int
+
+	prefetchBlocks int
+	prefetchMu     sync.Mutex
+	lastReadEnd    int64 // -1 until the first successful read
+	// prefetchedUpTo is the last block prefetched in the current sequential
+	// run, so that small reads within a block do not prefetch the same blocks
+	// again while they are in flight. -1 when no run is in progress.
+	prefetchedUpTo int64
 }
 
 // cacheKey includes the snapshot ID so that readers of different snapshots
@@ -218,6 +226,15 @@ type OpenOptions struct {
 	// unlimited, so a ReadAt spanning n uncached blocks issues n
 	// GetSnapshotBlock requests at once.
 	MaxConcurrentBlocks int
+
+	// PrefetchBlocks fetches this many blocks in the background after a read
+	// that starts where the previous successful read ended, or after the first
+	// read. It requires a Cache. Keep it small relative to the Cache: each
+	// prefetched block holds a goroutine until it is fetched and may be evicted
+	// before it is read, and a sequential read that stops soon after wastes up
+	// to this many requests. Prefetches count toward MaxConcurrentBlocks, and
+	// a failed one is dropped. A non-positive value, the default, disables it.
+	PrefetchBlocks int
 }
 
 var (
@@ -267,6 +284,9 @@ func OpenWithOptions(snapID string, ctx context.Context, cache Cache[string, []b
 	if options.BlockFetchAttempts <= 0 {
 		options.BlockFetchAttempts = DefaultBlockFetchAttempts
 	}
+	if options.PrefetchBlocks > 0 && cache == nil {
+		return nil, errors.New("ebsfile: OpenOptions.PrefetchBlocks requires a Cache")
+	}
 	input := &ebs.ListSnapshotBlocksInput{
 		SnapshotId: &snapID,
 	}
@@ -293,6 +313,10 @@ func OpenWithOptions(snapID string, ctx context.Context, cache Cache[string, []b
 	if options.MaxConcurrentBlocks > 0 {
 		f.fetchSem = make(chan struct{}, options.MaxConcurrentBlocks)
 	}
+	if options.PrefetchBlocks > 0 {
+		f.prefetchBlocks = options.PrefetchBlocks
+	}
+	f.lastReadEnd, f.prefetchedUpTo = -1, -1
 	return io.NewSectionReader(f, 0, f.Size()), nil
 }
 
@@ -315,8 +339,8 @@ func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
 	}
 
 	blockSize := int64(f.blockSize)
-	first := int32(off / blockSize)
-	errs := f.readBlocks(p[:end-off], off, first, int32((end-1)/blockSize))
+	first, last := int32(off/blockSize), int32((end-1)/blockSize)
+	errs := f.readBlocks(p[:end-off], off, first, last)
 
 	for i, err := range errs {
 		if err != nil {
@@ -333,7 +357,52 @@ func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
 	if n < len(p) {
 		return n, io.EOF
 	}
+	if f.prefetchBlocks > 0 {
+		f.prefetch(off, end, last)
+	}
 	return n, nil
+}
+
+// prefetch fetches the blocks after last in the background if the read
+// [off, end) starts where the previous successful read ended. Concurrent
+// readers make this miss sequential reads, which costs prefetches but never
+// returns wrong data.
+func (f *File) prefetch(off, end int64, last int32) {
+	from := int64(last) + 1
+	// Clamp before adding so that a huge PrefetchBlocks does not overflow.
+	limit := (f.size - 1) / int64(f.blockSize)
+	if n := int64(f.prefetchBlocks); n < limit-int64(last) {
+		limit = int64(last) + n
+	}
+
+	f.prefetchMu.Lock()
+	sequential := f.lastReadEnd == off || f.lastReadEnd == -1
+	f.lastReadEnd = end
+	if !sequential {
+		f.prefetchedUpTo = -1
+	} else if f.prefetchedUpTo >= from {
+		from = f.prefetchedUpTo + 1
+	}
+	if sequential && from <= limit {
+		f.prefetchedUpTo = limit
+	}
+	f.prefetchMu.Unlock()
+
+	if !sequential || from > limit || f.ctx.Err() != nil {
+		return
+	}
+	for i := from; i <= limit; i++ {
+		index := int32(i)
+		token, ok := f.blockTable[index]
+		if !ok {
+			continue
+		}
+		// fetchShared skips cached blocks, so the Cache is not consulted on
+		// the caller's path.
+		go func() {
+			_, _ = f.fetchShared(index, f.cacheKey(index), token)
+		}()
+	}
 }
 
 // readBlocks copies the blocks first to last into p, which holds the bytes
@@ -414,10 +483,11 @@ func (f *File) blockSpan(p []byte, off int64, index int32) ([]byte, int64) {
 }
 
 // fetchShared fetches the block at index and caches it under key, coalescing
-// concurrent fetches of it. The caller has already missed the cache.
+// concurrent fetches of it. A block already in the cache is returned from it.
 func (f *File) fetchShared(index int32, key, token string) ([]byte, error) {
 	v, err, _ := f.group.Do(key, func() (any, error) {
-		// Another fetch may have cached the block since the caller's Get.
+		// Prefetches do not look up the cache first, and another fetch may
+		// have cached the block since a reader's Get.
 		if buf, ok := f.cache.Get(key); ok {
 			return buf, nil
 		}

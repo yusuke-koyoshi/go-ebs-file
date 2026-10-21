@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1028,5 +1030,230 @@ func TestReadAt_ErrorInMiddleBlockReturnsPrecedingBytes(t *testing.T) {
 	}
 	if got := api.calls.Load(); got != 3 {
 		t.Errorf("GetSnapshotBlock calls = %d, want 3", got)
+	}
+}
+
+// recordBlocks makes api record the index of each GetSnapshotBlock call.
+func recordBlocks(api *countingEBS) func() []int32 {
+	var mu sync.Mutex
+	var indices []int32
+	api.blockErr = func(index int32) error {
+		mu.Lock()
+		defer mu.Unlock()
+		indices = append(indices, index)
+		return nil
+	}
+	return func() []int32 {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]int32(nil), indices...)
+	}
+}
+
+// waitForCalls waits for prefetches running in the background.
+func waitForCalls(t *testing.T, api *countingEBS, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for api.calls.Load() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("GetSnapshotBlock calls = %d, want %d", api.calls.Load(), want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Give an unexpected extra prefetch time to show up.
+	time.Sleep(50 * time.Millisecond)
+	if got := api.calls.Load(); got != want {
+		t.Fatalf("GetSnapshotBlock calls = %d, want %d", got, want)
+	}
+}
+
+func TestReadAt_PrefetchIsOffByDefault(t *testing.T) {
+	mock, _ := newPatternMock(16, 4)
+	api := &countingEBS{EBSAPI: mock}
+	sr, err := Open("snap-test", context.Background(), newMapCache(), api)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sr.ReadAt(make([]byte, 16), 0); err != nil {
+		t.Fatal(err)
+	}
+	waitForCalls(t, api, 1)
+}
+
+func TestReadAt_PrefetchFollowsSequentialReads(t *testing.T) {
+	mock, data := newPatternMock(16, 3)
+	api := &countingEBS{EBSAPI: mock}
+	sr, err := OpenWithOptions("snap-test", context.Background(), newMapCache(), api, OpenOptions{PrefetchBlocks: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sr.ReadAt(make([]byte, 16), 0); err != nil {
+		t.Fatal(err)
+	}
+	waitForCalls(t, api, 3)
+
+	// Blocks 1 and 2 were prefetched, and there is nothing after block 2.
+	buf := make([]byte, 32)
+	if _, err := sr.ReadAt(buf, 16); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, data[16:48]) {
+		t.Error("ReadAt returned wrong data")
+	}
+	waitForCalls(t, api, 3)
+}
+
+func TestReadAt_PrefetchWithHugePrefetchBlocks(t *testing.T) {
+	mock, _ := newPatternMock(16, 3)
+	api := &countingEBS{EBSAPI: mock}
+	sr, err := OpenWithOptions("snap-test", context.Background(), newMapCache(), api, OpenOptions{PrefetchBlocks: math.MaxInt})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Block 1 is read and block 2, the last one, is prefetched.
+	if _, err := sr.ReadAt(make([]byte, 16), 16); err != nil {
+		t.Fatal(err)
+	}
+	waitForCalls(t, api, 2)
+}
+
+func TestReadAt_PrefetchDoesNotFollowRandomAccess(t *testing.T) {
+	mock, _ := newPatternMock(16, 8)
+	api := &countingEBS{EBSAPI: mock}
+	sr, err := OpenWithOptions("snap-test", context.Background(), newMapCache(), api, OpenOptions{PrefetchBlocks: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The first read counts as sequential, so start on the last block, after
+	// which there is nothing to prefetch. No later read starts where the
+	// previous one ended.
+	offsets := []int64{112, 0, 64, 32, 96}
+	for _, off := range offsets {
+		if _, err := sr.ReadAt(make([]byte, 16), off); err != nil {
+			t.Fatalf("ReadAt(%d): %v", off, err)
+		}
+	}
+	waitForCalls(t, api, int64(len(offsets)))
+}
+
+func TestReadAt_PrefetchRestartsForEarlierSequentialRun(t *testing.T) {
+	mock, _ := newPatternMock(16, 6)
+	api := &countingEBS{EBSAPI: mock}
+	sr, err := OpenWithOptions("snap-test", context.Background(), newMapCache(), api, OpenOptions{PrefetchBlocks: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	read := func(block int64) {
+		t.Helper()
+		if _, err := sr.ReadAt(make([]byte, 16), block*16); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read(4) // the first read prefetches block 5
+	waitForCalls(t, api, 2)
+	read(0) // not sequential: no prefetch
+	waitForCalls(t, api, 3)
+	read(1) // a new sequential run before block 5 prefetches block 2
+	waitForCalls(t, api, 5)
+}
+
+func TestReadAt_PrefetchSkipsUnallocatedBlocks(t *testing.T) {
+	mock, _ := newPatternMock(16, 4)
+	mock.Allocated = map[int32]bool{0: true, 2: true, 3: true}
+	api := &countingEBS{EBSAPI: mock}
+	requested := recordBlocks(api)
+	sr, err := OpenWithOptions("snap-test", context.Background(), newMapCache(), api, OpenOptions{PrefetchBlocks: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sr.ReadAt(make([]byte, 16), 0); err != nil {
+		t.Fatal(err)
+	}
+	waitForCalls(t, api, 2)
+	for _, index := range requested() {
+		if index == 1 {
+			t.Errorf("unallocated block 1 was requested: %v", requested())
+		}
+	}
+}
+
+func TestOpenWithOptions_PrefetchRequiresCache(t *testing.T) {
+	mock, _ := newPatternMock(16, 1)
+	if _, err := OpenWithOptions("snap-test", context.Background(), nil, mock, OpenOptions{PrefetchBlocks: 1}); err == nil {
+		t.Fatal("OpenWithOptions with PrefetchBlocks and no Cache succeeded")
+	}
+}
+
+func TestReadAt_PrefetchWithConcurrentSequentialReaders(t *testing.T) {
+	const blockSize, numBlocks = 16, 8
+	mock, data := newPatternMock(blockSize, numBlocks)
+	sr, err := OpenWithOptions("snap-test", context.Background(), newMapCache(), mock, OpenOptions{PrefetchBlocks: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for r := 0; r < 2; r++ {
+		wg.Add(1)
+		go func(start int) {
+			defer wg.Done()
+			for off := start; off < start+len(data)/2; off += 8 {
+				buf := make([]byte, 8)
+				if _, err := sr.ReadAt(buf, int64(off)); err != nil || !bytes.Equal(buf, data[off:off+8]) {
+					t.Errorf("ReadAt(%d): err=%v", off, err)
+					return
+				}
+			}
+		}(r * len(data) / 2)
+	}
+	wg.Wait()
+}
+
+// BenchmarkReadAt_Prefetch reads the whole volume into an empty cache: in
+// order one block or 4 KiB at a time, or one block at a time in an order where
+// no read follows the previous one.
+func BenchmarkReadAt_Prefetch(b *testing.B) {
+	const blockSize, numBlocks = 512 * 1024, 16
+	const volumeSize = blockSize * numBlocks
+	for _, bench := range []struct {
+		name     string
+		readSize int
+		offset   func(i int) int
+	}{
+		{name: "sequential", readSize: blockSize, offset: func(i int) int { return i * blockSize }},
+		{name: "sequential-4KiB", readSize: 4 * 1024, offset: func(i int) int { return i * 4 * 1024 }},
+		// 5 is coprime with 16, so this visits every block, never next to the previous one.
+		{name: "random", readSize: blockSize, offset: func(i int) int { return (i * 5) % numBlocks * blockSize }},
+	} {
+		for _, prefetch := range []int{0, 4} {
+			b.Run(fmt.Sprintf("%s/prefetch=%d", bench.name, prefetch), func(b *testing.B) {
+				mock, _ := newPatternMock(blockSize, numBlocks)
+				api := &countingEBS{EBSAPI: mock, latency: time.Millisecond}
+				buf := make([]byte, bench.readSize)
+				for i := 0; i < b.N; i++ {
+					sr, err := OpenWithOptions("benchmark-snapshot", context.Background(), newMapCache(), api, OpenOptions{PrefetchBlocks: prefetch})
+					if err != nil {
+						b.Fatal(err)
+					}
+					for j := 0; j < volumeSize/bench.readSize; j++ {
+						if _, err := sr.ReadAt(buf, int64(bench.offset(j))); err != nil {
+							b.Fatal(err)
+						}
+					}
+					// Wait for prefetches so that they do not overlap the next
+					// iteration. Every block is requested once per iteration.
+					for api.calls.Load() < int64(numBlocks*(i+1)) || api.inFlight.Load() > 0 {
+						time.Sleep(10 * time.Microsecond)
+					}
+				}
+				b.ReportMetric(float64(api.calls.Load())/float64(b.N), "requests/op")
+			})
+		}
 	}
 }
